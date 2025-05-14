@@ -9,8 +9,11 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
 import numpy as np
 import time
+import optuna
 
-FOLDS = 50
+FOLDS = 5
+NUM_TRIALS = 100
+SUBMISSION_ID = time.strftime("%Y%m%d-%H%M%S")
 
 
 def add_feature_cross_terms(df, numerical_features):
@@ -22,6 +25,59 @@ def add_feature_cross_terms(df, numerical_features):
             cross_term_name = f"{feature1}_x_{feature2}"
             df_new[cross_term_name] = df[feature1] * df[feature2]
     return df_new
+
+
+def objective(trial, x_train, y_train, x_val, y_val):
+    param = {
+        "verbosity": 0,
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        "booster": trial.suggest_categorical("booster", ["gbtree", "gblinear", "dart"]),
+        "lambda": trial.suggest_float("lambda", 1e-8, 1.0, log=True),
+        "alpha": trial.suggest_float("alpha", 1e-8, 1.0, log=True),
+        "subsample": trial.suggest_float("subsample", 0.2, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
+    }
+
+    if param["booster"] == "gbtree" or param["booster"] == "dart":
+        param["max_depth"] = trial.suggest_int("max_depth", 1, 9)
+        param["min_child_weight"] = trial.suggest_int("min_child_weight", 2, 10)
+        param["eta"] = trial.suggest_float("eta", 1e-8, 1.0, log=True)
+        param["gamma"] = trial.suggest_float("gamma", 1e-8, 1.0, log=True)
+        param["grow_policy"] = trial.suggest_categorical(
+            "grow_policy", ["depthwise", "lossguide"]
+        )
+    if param["booster"] == "dart":
+        param["sample_type"] = trial.suggest_categorical(
+            "sample_type", ["uniform", "weighted"]
+        )
+        param["normalize_type"] = trial.suggest_categorical(
+            "normalize_type", ["tree", "forest"]
+        )
+        param["rate_drop"] = trial.suggest_float("rate_drop", 1e-8, 1.0, log=True)
+        param["skip_drop"] = trial.suggest_float("skip_drop", 1e-8, 1.0, log=True)
+
+    inner_cv = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
+    oof = np.zeros(x_train.shape[0])
+
+    for train_idx, val_idx in inner_cv.split(x_train, y_train):
+        x_train_inner = x_train[train_idx]
+        y_train_inner = y_train[train_idx]
+        x_val_inner = x_train[val_idx]
+        y_val_inner = y_train[val_idx]
+
+        model = xgb.train(
+            param,
+            xgb.DMatrix(x_train_inner, label=y_train_inner),
+            num_boost_round=10000,
+            evals=[(xgb.DMatrix(x_val_inner, label=y_val_inner), "val")],
+            early_stopping_rounds=100,
+        )
+        preds = model.predict(xgb.DMatrix(x_val_inner))
+        oof[val_idx] = preds
+
+    rmse = np.sqrt(mean_squared_error(y_train, oof))
+    return rmse
 
 
 def submission_pipeline(train_file_path, test_file_path, create_submission=False):
@@ -66,44 +122,53 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
     X = preprocessor.transform(X)
     X_test = preprocessor.transform(X_test)
 
-    kf = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
+    outer_cv = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
 
     oof = np.zeros(X.shape[0])
     pred = np.zeros(X_test.shape[0])
 
-    for i, (train_idx, valid_idx) in enumerate(kf.split(X, y)):
+    for i, (train_idx_outer, valid_idx_outer) in enumerate(outer_cv.split(X, y)):
         print(f"\n {'#' * 10} Fold {i+1} {'#'*10}")
-
-        x_train = X.iloc[train_idx].copy()
-        y_train = y.iloc[train_idx]
-        x_val = X.iloc[valid_idx].copy()
-        y_val = y.iloc[valid_idx]
-        x_test = X_test.copy()
-
         start = time.time()
 
-        model = xgb.XGBRegressor(
-            device="cuda",
-            max_depth=10,
-            colsample_bytree=0.75,
-            subsample=0.9,
-            n_estimators=2000,
-            learning_rate=0.02,
-            gamma=0.01,
-            max_delta_step=2,
-            early_stopping_rounds=100,
-            eval_metric="rmse",
-            enable_categorical=True,
-        )
+        x_train_outer = X.iloc[train_idx_outer].copy()
+        y_train_outer = y.iloc[train_idx_outer]
+        x_val_outer = X.iloc[valid_idx_outer].copy()
+        y_val_outer = y.iloc[valid_idx_outer]
+        x_test = X_test.copy()
 
-        # Fitting the model
-        model.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=100)
+        # Optimizing hyperparameters
+        study = optuna.create_study(
+            storage=f"sqlite:///data/optuna/optuna_study_{SUBMISSION_ID}.db",
+            direction="minimize",
+            study_name=f"{SUBMISSION_ID}_{i+1}",
+            load_if_exists=True,
+        )
+        study.optimize(
+            lambda trial: objective(
+                trial, x_train_outer, y_train_outer, x_val_outer, y_val_outer
+            ),
+            n_trials=NUM_TRIALS,
+        )
+        best_hparams_for_fold = study.best_params
+        print("Best hyperparameters for fold:", best_hparams_for_fold)
+        print("Best RMSE for fold:", study.best_value)
+
+        # Training the model
+        model = xgb.train(
+            best_hparams_for_fold,
+            xgb.DMatrix(x_train_outer, label=y_train_outer),
+            num_boost_round=10000,
+            evals=[(xgb.DMatrix(x_val_outer, label=y_val_outer), "val")],
+            early_stopping_rounds=100,
+        )
+        oof[valid_idx_outer] = model.predict(xgb.DMatrix(x_val_outer))
 
         # Making predictions
-        oof[valid_idx] = model.predict(x_val)
-        pred += model.predict(x_test)
+        preds = model.predict(xgb.DMatrix(x_test))
+        pred += preds
 
-        rmse = np.sqrt(mean_squared_error(y_val, oof[valid_idx]))
+        rmse = np.sqrt(mean_squared_error(y_val_outer, oof[valid_idx_outer]))
         print(f"Fold {i+1} RMSE: {rmse:.4f}")
         print(f"Time: {time.time() - start:.2f} seconds")
 
@@ -118,9 +183,9 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
         y_preds = np.expm1(pred)
         y_preds = np.clip(y_preds, 1, 314)
         submission_df = pd.DataFrame({"id": test_data["id"], "Calories": y_preds})
-        submission_id = time.strftime("%Y%m%d-%H%M%S")
+
         submission_df.to_csv(
-            f"data/submission/submission_{submission_id}.csv", index=False
+            f"data/submission/submission_{SUBMISSION_ID}.csv", index=False
         )
 
 

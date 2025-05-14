@@ -10,6 +10,7 @@ from sklearn.metrics import mean_squared_error
 import numpy as np
 import time
 import optuna
+from loguru import logger
 
 FOLDS = 5
 NUM_TRIALS = 25
@@ -58,7 +59,7 @@ def objective(trial, x_train, y_train):
         param["rate_drop"] = trial.suggest_float("rate_drop", 1e-8, 1.0, log=True)
         param["skip_drop"] = trial.suggest_float("skip_drop", 1e-8, 1.0, log=True)
 
-    print(f"Trial {trial.number} parameters: {param}")
+    logger.info(f"Trial {trial.number} parameters: {param}")
 
     inner_cv = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
     oof = np.zeros(x_train.shape[0])
@@ -82,7 +83,7 @@ def objective(trial, x_train, y_train):
         oof[val_idx] = preds
 
     rmse = np.sqrt(mean_squared_error(y_train, oof))
-    print(f"RMSE for trial {trial.number}: {rmse:.4f}")
+    logger.info(f"RMSE for trial {trial.number}: {rmse:.4f}")
     return rmse
 
 
@@ -103,8 +104,8 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
         .columns.tolist()
     )
 
-    print("Numerical columns:", numerical_cols)
-    print("Categorical columns:", categorical_cols)
+    logger.info("Numerical columns: %s", numerical_cols)
+    logger.info("Categorical columns: %s", categorical_cols)
 
     # train_data = add_feature_cross_terms(train_data, numerical_cols)
     # test_data = add_feature_cross_terms(test_data, numerical_cols)
@@ -134,7 +135,7 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
     pred = np.zeros(X_test.shape[0])
 
     for i, (train_idx_outer, valid_idx_outer) in enumerate(outer_cv.split(X, y)):
-        print(f"\n {'#' * 10} Fold {i+1} {'#'*10}")
+        logger.info(f"\n {'#' * 10} Fold {i+1} {'#'*10}")
         start = time.time()
 
         x_train_outer = X.iloc[train_idx_outer].copy()
@@ -156,8 +157,8 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
             n_jobs=10,
         )
         best_hparams_for_fold = study.best_params
-        print("Best hyperparameters for fold:", best_hparams_for_fold)
-        print("Best RMSE for fold:", study.best_value)
+        logger.info("Best hyperparameters for fold: %s", best_hparams_for_fold)
+        logger.info("Best RMSE for fold: %s", study.best_value)
 
         # Training the model
         model = xgb.train(
@@ -175,14 +176,14 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
         pred += preds
 
         rmse = np.sqrt(mean_squared_error(y_val_outer, oof[valid_idx_outer]))
-        print(f"Fold {i+1} RMSE: {rmse:.4f}")
-        print(f"Time: {time.time() - start:.2f} seconds")
+        logger.info(f"Fold {i+1} RMSE: {rmse:.4f}")
+        logger.info(f"Time: {time.time() - start:.2f} seconds")
 
     pred /= FOLDS
 
     # Final RMSE
     full_rmse = np.sqrt(mean_squared_error(y, oof))
-    print(f"\nFinal CV RMSE: {full_rmse:.4f}")
+    logger.info(f"\nFinal CV RMSE: {full_rmse:.4f}")
 
     # Creating a DataFrame for submission
     if create_submission:

@@ -12,7 +12,7 @@ import time
 import optuna
 
 FOLDS = 5
-NUM_TRIALS = 100
+NUM_TRIALS = 25
 SUBMISSION_ID = time.strftime("%Y%m%d-%H%M%S")
 
 
@@ -27,11 +27,12 @@ def add_feature_cross_terms(df, numerical_features):
     return df_new
 
 
-def objective(trial, x_train, y_train, x_val, y_val):
+def objective(trial, x_train, y_train):
     param = {
         "verbosity": 0,
         "objective": "reg:squarederror",
         "eval_metric": "rmse",
+        "device": "cuda",
         "booster": trial.suggest_categorical("booster", ["gbtree", "gblinear", "dart"]),
         "lambda": trial.suggest_float("lambda", 1e-8, 1.0, log=True),
         "alpha": trial.suggest_float("alpha", 1e-8, 1.0, log=True),
@@ -57,26 +58,31 @@ def objective(trial, x_train, y_train, x_val, y_val):
         param["rate_drop"] = trial.suggest_float("rate_drop", 1e-8, 1.0, log=True)
         param["skip_drop"] = trial.suggest_float("skip_drop", 1e-8, 1.0, log=True)
 
+    print(f"Trial {trial.number} parameters: {param}")
+
     inner_cv = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
     oof = np.zeros(x_train.shape[0])
 
-    for train_idx, val_idx in inner_cv.split(x_train, y_train):
-        x_train_inner = x_train[train_idx]
-        y_train_inner = y_train[train_idx]
-        x_val_inner = x_train[val_idx]
-        y_val_inner = y_train[val_idx]
+    for i, (train_idx, val_idx) in enumerate(inner_cv.split(x_train, y_train)):
+        # print(f"Trial {trial.number} Inner CV fold {i}")
+        x_train_inner = x_train.iloc[train_idx]
+        y_train_inner = y_train.iloc[train_idx]
+        x_val_inner = x_train.iloc[val_idx]
+        y_val_inner = y_train.iloc[val_idx]
 
         model = xgb.train(
             param,
             xgb.DMatrix(x_train_inner, label=y_train_inner),
-            num_boost_round=10000,
+            num_boost_round=100000,
             evals=[(xgb.DMatrix(x_val_inner, label=y_val_inner), "val")],
             early_stopping_rounds=100,
+            verbose_eval=False,
         )
         preds = model.predict(xgb.DMatrix(x_val_inner))
         oof[val_idx] = preds
 
     rmse = np.sqrt(mean_squared_error(y_train, oof))
+    print(f"RMSE for trial {trial.number}: {rmse:.4f}")
     return rmse
 
 
@@ -139,16 +145,15 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
 
         # Optimizing hyperparameters
         study = optuna.create_study(
-            storage=f"sqlite:///data/optuna/optuna_study_{SUBMISSION_ID}.db",
+            storage="sqlite:///data/optuna_study.db",
             direction="minimize",
             study_name=f"{SUBMISSION_ID}_{i+1}",
             load_if_exists=True,
         )
         study.optimize(
-            lambda trial: objective(
-                trial, x_train_outer, y_train_outer, x_val_outer, y_val_outer
-            ),
+            lambda trial: objective(trial, x_train_outer, y_train_outer),
             n_trials=NUM_TRIALS,
+            n_jobs=10,
         )
         best_hparams_for_fold = study.best_params
         print("Best hyperparameters for fold:", best_hparams_for_fold)
@@ -158,9 +163,10 @@ def submission_pipeline(train_file_path, test_file_path, create_submission=False
         model = xgb.train(
             best_hparams_for_fold,
             xgb.DMatrix(x_train_outer, label=y_train_outer),
-            num_boost_round=10000,
+            num_boost_round=100000,
             evals=[(xgb.DMatrix(x_val_outer, label=y_val_outer), "val")],
             early_stopping_rounds=100,
+            verbose_eval=100,
         )
         oof[valid_idx_outer] = model.predict(xgb.DMatrix(x_val_outer))
 
